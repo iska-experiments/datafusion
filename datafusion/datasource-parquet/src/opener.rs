@@ -22,6 +22,7 @@ use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::{
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
     apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
+    transform_schema_to_view,
 };
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::DataType;
@@ -96,6 +97,8 @@ pub(super) struct ParquetOpener {
     pub reorder_filters: bool,
     /// Should we force the reader to use RowSelections for filtering
     pub force_filter_selections: bool,
+    /// Decode view types before adapting columns to the table schema
+    pub schema_force_view_types: bool,
     /// Should the page index be read from parquet files, if present, to skip
     /// data pages
     pub enable_page_index: bool,
@@ -263,6 +266,7 @@ impl FileOpener for ParquetOpener {
         let reorder_predicates = self.reorder_filters;
         let pushdown_filters = self.pushdown_filters;
         let force_filter_selections = self.force_filter_selections;
+        let schema_force_view_types = self.schema_force_view_types;
         let coerce_int96 = self.coerce_int96;
         let enable_bloom_filter = self.enable_bloom_filter;
         let enable_row_group_stats_pruning = self.enable_row_group_stats_pruning;
@@ -381,6 +385,12 @@ impl FileOpener for ParquetOpener {
                 &physical_file_schema,
             ) {
                 physical_file_schema = Arc::new(merged);
+            }
+            if schema_force_view_types {
+                physical_file_schema =
+                    Arc::new(transform_schema_to_view(&physical_file_schema));
+            }
+            if physical_file_schema.as_ref() != reader_metadata.schema().as_ref() {
                 options = options.with_schema(Arc::clone(&physical_file_schema));
                 reader_metadata = ArrowReaderMetadata::try_new(
                     Arc::clone(reader_metadata.metadata()),
@@ -1025,6 +1035,9 @@ fn should_enable_page_index(
 
 #[cfg(test)]
 mod test {
+    #[path = "view_test.rs"]
+    mod views;
+
     use std::sync::Arc;
 
     use super::{ConstantColumns, constant_columns_from_stats};
@@ -1197,6 +1210,7 @@ mod test {
                 pushdown_filters: self.pushdown_filters,
                 reorder_filters: self.reorder_filters,
                 force_filter_selections: self.force_filter_selections,
+                schema_force_view_types: true,
                 enable_page_index: self.enable_page_index,
                 enable_bloom_filter: self.enable_bloom_filter,
                 enable_row_group_stats_pruning: self.enable_row_group_stats_pruning,

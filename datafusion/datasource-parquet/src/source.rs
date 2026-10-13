@@ -557,6 +557,10 @@ impl FileSource for ParquetSource {
             pushdown_filters: self.pushdown_filters(),
             reorder_filters: self.reorder_filters(),
             force_filter_selections: self.force_filter_selections(),
+            schema_force_view_types: self
+                .table_parquet_options
+                .global
+                .schema_force_view_types,
             enable_page_index: self.enable_page_index(),
             enable_bloom_filter: self.bloom_filter_on_read(),
             enable_row_group_stats_pruning: self.table_parquet_options.global.pruning,
