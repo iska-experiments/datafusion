@@ -2035,6 +2035,10 @@ async fn collect_left_input(
 }
 
 #[cfg(test)]
+#[path = "membership_test.rs"]
+mod membership_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

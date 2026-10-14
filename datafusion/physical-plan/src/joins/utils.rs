@@ -1390,6 +1390,8 @@ pub(crate) struct BuildProbeJoinMetrics {
     pub(crate) probe_hit_rate: metrics::RatioMetrics,
     /// Average number of build matches per matched probe row
     pub(crate) avg_fanout: metrics::RatioMetrics,
+    /// Probe rows resolved directly from dense membership
+    pub(crate) membership_probe_rows: metrics::Count,
 }
 
 // This Drop implementation updates the elapsed compute part of the metrics.
@@ -1452,6 +1454,8 @@ impl BuildProbeJoinMetrics {
             baseline,
             probe_hit_rate,
             avg_fanout,
+            membership_probe_rows: MetricBuilder::new(metrics)
+                .counter("membership_probe_rows", partition),
         }
     }
 }

@@ -661,6 +661,51 @@ impl HashJoinStream {
             return Ok(StatefulStreamResult::Ready(Some(result)));
         }
 
+        if self.filter.is_none()
+            && self.null_equality == NullEquality::NullEqualsNothing
+            && matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti)
+            && let Map::ArrayMap(map) = build_side.left_data.map()
+            && map.num_of_distinct_key()
+                == build_side.left_data.batch().num_rows()
+                    - build_side.left_data.values()[0].null_count()
+        {
+            let membership = map.contain_keys(&state.values)?;
+            let hits = membership.true_count();
+            let keep = self.join_type == JoinType::RightSemi;
+            let indices = UInt32Array::from_iter_values(
+                membership
+                    .values()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, present)| (present == keep).then_some(i as u32)),
+            );
+            self.join_metrics.probe_hit_rate.add_part(hits);
+            self.join_metrics.avg_fanout.add_part(hits);
+            self.join_metrics.avg_fanout.add_total(hits);
+            self.join_metrics
+                .membership_probe_rows
+                .add(state.batch.num_rows());
+            let batch = build_batch_from_indices(
+                &self.schema,
+                build_side.left_data.batch(),
+                &state.batch,
+                &UInt64Array::new_null(0),
+                &indices,
+                &self.column_indices,
+                JoinSide::Left,
+                self.join_type,
+            )?;
+            let status = self.output_buffer.push_batch(batch)?;
+            timer.done();
+            self.state = if status == PushBatchStatus::LimitReached {
+                self.output_buffer.finish()?;
+                HashJoinStreamState::Completed
+            } else {
+                HashJoinStreamState::FetchProbeBatch
+            };
+            return Ok(StatefulStreamResult::Continue);
+        }
+
         // get the matched by join keys indices
         let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
         {
