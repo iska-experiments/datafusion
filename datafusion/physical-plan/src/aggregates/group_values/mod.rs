@@ -30,6 +30,7 @@ use datafusion_expr::EmitTo;
 
 pub mod multi_group_by;
 
+mod packed;
 mod row;
 mod single_group_by;
 use datafusion_physical_expr::binary_map::OutputType;
@@ -135,6 +136,12 @@ pub fn new_group_values(
     schema: SchemaRef,
     group_ordering: &GroupOrdering,
 ) -> Result<Box<dyn GroupValues>> {
+    if matches!(group_ordering, GroupOrdering::None)
+        && let Some(groups) =
+            packed::PackedGroups::try_new(std::sync::Arc::clone(&schema))
+    {
+        return Ok(Box::new(groups));
+    }
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();
 
