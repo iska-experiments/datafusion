@@ -46,7 +46,7 @@ use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
 use datafusion_expr::EmitTo;
 use datafusion_physical_expr::binary_map::OutputType;
 
-use hashbrown::hash_table::HashTable;
+use hashbrown::hash_table::{Entry, HashTable};
 
 const NON_INLINED_FLAG: u64 = 0x8000000000000000;
 const VALUE_MASK: u64 = 0x7FFFFFFFFFFFFFFF;
@@ -501,25 +501,21 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
 
         let mut group_values_len = self.group_values[0].len();
         for (row, &target_hash) in batch_hashes.iter().enumerate() {
-            let entry = self
-                .map
-                .find(target_hash, |(exist_hash, _)| target_hash == *exist_hash);
+            let next = GroupIndexView::new_inlined(group_values_len as u64);
+            let (group_index_view, inserted) = match self.map.entry(
+                target_hash,
+                |(exist_hash, _)| target_hash == *exist_hash,
+                |(hash, _)| *hash,
+            ) {
+                Entry::Occupied(entry) => (entry.get().1, false),
+                Entry::Vacant(entry) => {
+                    entry.insert((target_hash, next));
+                    (next, true)
+                }
+            };
 
-            let Some((_, group_index_view)) = entry else {
-                // 1. Bucket not found case
-                // Build `new inlined group index view`
+            if inserted {
                 let current_group_idx = group_values_len;
-                let group_index_view =
-                    GroupIndexView::new_inlined(current_group_idx as u64);
-
-                // Insert the `group index view` and its hash into `map`
-                // for hasher function, use precomputed hash value
-                self.map.insert_accounted(
-                    (target_hash, group_index_view),
-                    |(hash, _)| *hash,
-                    &mut self.map_size,
-                );
-
                 // Add row index to `vectorized_append_row_indices`
                 self.vectorized_operation_buffers
                     .append_row_indices
@@ -557,6 +553,7 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     .push(group_index);
             }
         }
+        self.map_size = self.map.capacity() * size_of::<(u64, GroupIndexView)>();
     }
 
     /// Perform `vectorized_append`` for `rows` in `vectorized_append_row_indices`
@@ -1247,6 +1244,10 @@ enum Nulls {
     /// There are no `null`s in the array items
     None,
 }
+
+#[cfg(test)]
+#[path = "entry_test.rs"]
+mod entry_tests;
 
 #[cfg(test)]
 mod tests {
