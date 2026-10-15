@@ -26,7 +26,11 @@ use datafusion_common::Result;
 use itertools::izip;
 use std::marker::PhantomData;
 use std::mem::{replace, size_of};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+#[cfg(test)]
+#[path = "view_buffer_test.rs"]
+mod reuse_tests;
 
 const BYTE_VIEW_MAX_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 
@@ -71,6 +75,10 @@ pub struct ByteViewGroupValueBuilder<B: ByteViewType> {
 
     /// phantom data so the type requires `<B>`
     _phantom: PhantomData<B>,
+    reuse_buffers: bool,
+    // Keep allocation identity without retaining input array
+    input: Option<Weak<dyn Array>>,
+    input_base: Option<u32>,
 }
 
 impl<B: ByteViewType> Default for ByteViewGroupValueBuilder<B> {
@@ -88,7 +96,51 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
             max_block_size: BYTE_VIEW_MAX_BLOCK_SIZE,
             nulls: MaybeNullBufferBuilder::new(),
             _phantom: PhantomData {},
+            reuse_buffers: false,
+            input: None,
+            input_base: None,
         }
+    }
+
+    pub(super) fn with_buffer_reuse(mut self, reuse: bool) -> Self {
+        self.reuse_buffers = reuse;
+        self
+    }
+
+    fn prepare_input(&mut self, array: &ArrayRef, rows: usize) {
+        if !self.reuse_buffers
+            || self
+                .input
+                .as_ref()
+                .is_some_and(|a| std::ptr::addr_eq(a.as_ptr(), Arc::as_ptr(array)))
+        {
+            return;
+        }
+        self.input = Some(Arc::downgrade(array));
+        self.input_base = None;
+        let buffers = array.as_byte_view::<B>().data_buffers();
+        let bytes = buffers.iter().try_fold(0usize, |n, b| {
+            n.checked_add(b.capacity().max(b.len()))?
+                .checked_add(2 * size_of::<Buffer>())
+        });
+        if buffers.is_empty()
+            || bytes
+                .zip(rows.checked_mul(size_of::<u128>()))
+                .is_none_or(|(bytes, budget)| bytes > budget)
+        {
+            return;
+        }
+        if !self.in_progress.is_empty() {
+            self.flush_in_progress();
+        }
+        let Some(end) = self.completed.len().checked_add(buffers.len()) else {
+            return;
+        };
+        if u32::try_from(end).is_err() {
+            return;
+        }
+        self.input_base = Some(self.completed.len() as u32);
+        self.completed.extend(buffers.iter().cloned());
     }
 
     /// Set the max block size
@@ -104,6 +156,7 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
     }
 
     fn append_val_inner(&mut self, array: &ArrayRef, row: usize) {
+        self.prepare_input(array, 1);
         let arr = array.as_byte_view::<B>();
 
         // Null row case, set and return
@@ -146,6 +199,7 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
     }
 
     fn vectorized_append_inner(&mut self, array: &ArrayRef, rows: &[usize]) {
+        self.prepare_input(array, rows.len());
         let arr = array.as_byte_view::<B>();
         let null_count = array.null_count();
         let num_rows = array.len();
@@ -189,6 +243,12 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
         let view = if value_len <= 12 {
             make_view(value, 0, 0)
         } else {
+            if let Some(base) = self.input_base {
+                let mut view = ByteView::from(array.views()[row]);
+                view.buffer_index += base;
+                self.views.push(view.as_u128());
+                return;
+            }
             // Ensure big enough block to hold the value firstly
             self.ensure_in_progress_big_enough(value_len);
 
@@ -338,9 +398,15 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
 
         // The `n == len` case, we need to take all
         if self.len() == n {
-            let new_builder = Self::new().with_max_block_size(self.max_block_size);
+            let new_builder = Self::new()
+                .with_max_block_size(self.max_block_size)
+                .with_buffer_reuse(self.reuse_buffers);
             let cur_builder = replace(self, new_builder);
             return cur_builder.build_inner();
+        }
+
+        if self.reuse_buffers {
+            return self.take_retained(n);
         }
 
         // The `n < len` case
@@ -437,6 +503,46 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
                 null_buffer,
             ))
         }
+    }
+
+    fn take_retained(&mut self, n: usize) -> ArrayRef {
+        self.input = None;
+        self.input_base = None;
+        if !self.in_progress.is_empty() {
+            self.flush_in_progress();
+        }
+        let nulls = self.nulls.take_n(n);
+        let views = self.views.drain(..n).collect::<Vec<_>>();
+        // Reused views may reference earlier blocks after later groups are emitted
+        let output = Self::compact_retained(GenericByteViewArray::<B>::new(
+            views.into(),
+            self.completed.clone(),
+            nulls,
+        ));
+        let remaining_nulls =
+            replace(&mut self.nulls, MaybeNullBufferBuilder::new()).build();
+        let remaining = Self::compact_retained(GenericByteViewArray::<B>::new(
+            std::mem::take(&mut self.views).into(),
+            std::mem::take(&mut self.completed),
+            remaining_nulls,
+        ));
+        for row in 0..remaining.len() {
+            self.nulls.append(remaining.is_null(row));
+        }
+        self.views = remaining.views().to_vec();
+        self.completed = remaining.data_buffers().to_vec();
+        Arc::new(output)
+    }
+
+    fn compact_retained(array: GenericByteViewArray<B>) -> GenericByteViewArray<B> {
+        let bytes = array.data_buffers().iter().fold(0usize, |n, b| {
+            n.saturating_add(b.capacity().max(b.len()))
+                .saturating_add(2 * size_of::<Buffer>())
+        });
+        let budget = array
+            .total_buffer_bytes_used()
+            .max(array.len().saturating_mul(size_of::<u128>()));
+        if bytes > budget { array.gc() } else { array }
     }
 
     fn take_buffers_with_whole_last(
@@ -560,13 +666,17 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
         let buffers_size = self
             .completed
             .iter()
-            .map(|buf| buf.capacity() * size_of::<u8>())
+            .map(|buf| buf.capacity().max(buf.len()))
             .sum::<usize>();
 
         self.nulls.allocated_size()
             + self.views.capacity() * size_of::<u128>()
             + self.in_progress.capacity() * size_of::<u8>()
+            + self.completed.capacity() * size_of::<Buffer>()
             + buffers_size
+            + self.input.as_ref().map_or(0, |_| {
+                size_of::<GenericByteViewArray<B>>() + 2 * size_of::<usize>()
+            })
             + size_of::<Self>()
     }
 
