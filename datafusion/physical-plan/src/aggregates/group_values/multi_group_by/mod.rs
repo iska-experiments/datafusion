@@ -1030,11 +1030,13 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                         v.push(Box::new(b) as _)
                     }
                     &DataType::Utf8View => {
-                        let b = ByteViewGroupValueBuilder::<StringViewType>::new();
+                        let b = ByteViewGroupValueBuilder::<StringViewType>::new()
+                            .with_view_reuse(!STREAMING);
                         v.push(Box::new(b) as _)
                     }
                     &DataType::BinaryView => {
-                        let b = ByteViewGroupValueBuilder::<BinaryViewType>::new();
+                        let b = ByteViewGroupValueBuilder::<BinaryViewType>::new()
+                            .with_view_reuse(!STREAMING);
                         v.push(Box::new(b) as _)
                     }
                     &DataType::Boolean => {

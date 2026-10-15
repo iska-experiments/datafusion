@@ -19,14 +19,20 @@ use crate::aggregates::group_values::multi_group_by::{
     GroupColumn, Nulls, nulls_equal_to,
 };
 use crate::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
+use ahash::RandomState;
 use arrow::array::{Array, ArrayRef, AsArray, ByteView, GenericByteViewArray, make_view};
 use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::datatypes::ByteViewType;
 use datafusion_common::Result;
+use hashbrown::HashMap;
 use itertools::izip;
 use std::marker::PhantomData;
 use std::mem::{replace, size_of};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+#[cfg(test)]
+#[path = "view_reuse_test.rs"]
+mod reuse_tests;
 
 const BYTE_VIEW_MAX_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 
@@ -71,6 +77,10 @@ pub struct ByteViewGroupValueBuilder<B: ByteViewType> {
 
     /// phantom data so the type requires `<B>`
     _phantom: PhantomData<B>,
+    reuse_views: bool,
+    // Reserve allocation identity without retaining input buffers
+    input: Option<Weak<dyn Array>>,
+    copied_views: HashMap<u128, u128, RandomState>,
 }
 
 impl<B: ByteViewType> Default for ByteViewGroupValueBuilder<B> {
@@ -88,6 +98,26 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
             max_block_size: BYTE_VIEW_MAX_BLOCK_SIZE,
             nulls: MaybeNullBufferBuilder::new(),
             _phantom: PhantomData {},
+            reuse_views: false,
+            input: None,
+            copied_views: HashMap::default(),
+        }
+    }
+
+    pub(super) fn with_view_reuse(mut self, reuse: bool) -> Self {
+        self.reuse_views = reuse;
+        self
+    }
+
+    fn prepare_input(&mut self, array: &ArrayRef) {
+        if self.reuse_views
+            && !self
+                .input
+                .as_ref()
+                .is_some_and(|a| std::ptr::addr_eq(a.as_ptr(), Arc::as_ptr(array)))
+        {
+            self.copied_views.clear();
+            self.input = Some(Arc::downgrade(array));
         }
     }
 
@@ -104,6 +134,7 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
     }
 
     fn append_val_inner(&mut self, array: &ArrayRef, row: usize) {
+        self.prepare_input(array);
         let arr = array.as_byte_view::<B>();
 
         // Null row case, set and return
@@ -146,6 +177,7 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
     }
 
     fn vectorized_append_inner(&mut self, array: &ArrayRef, rows: &[usize]) {
+        self.prepare_input(array);
         let arr = array.as_byte_view::<B>();
         let null_count = array.null_count();
         let num_rows = array.len();
@@ -189,6 +221,12 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
         let view = if value_len <= 12 {
             make_view(value, 0, 0)
         } else {
+            if self.reuse_views
+                && let Some(&view) = self.copied_views.get(&array.views()[row])
+            {
+                self.views.push(view);
+                return;
+            }
             // Ensure big enough block to hold the value firstly
             self.ensure_in_progress_big_enough(value_len);
 
@@ -197,7 +235,11 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
             let offset = self.in_progress.len();
             self.in_progress.extend_from_slice(value);
 
-            make_view(value, buffer_index as u32, offset as u32)
+            let view = make_view(value, buffer_index as u32, offset as u32);
+            if self.reuse_views {
+                self.copied_views.insert(array.views()[row], view);
+            }
+            view
         };
 
         // Append view
@@ -338,9 +380,15 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
 
         // The `n == len` case, we need to take all
         if self.len() == n {
-            let new_builder = Self::new().with_max_block_size(self.max_block_size);
+            let new_builder = Self::new()
+                .with_max_block_size(self.max_block_size)
+                .with_view_reuse(self.reuse_views);
             let cur_builder = replace(self, new_builder);
             return cur_builder.build_inner();
+        }
+
+        if self.reuse_views {
+            return self.take_reused(n);
         }
 
         // The `n < len` case
@@ -437,6 +485,33 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
                 null_buffer,
             ))
         }
+    }
+
+    fn take_reused(&mut self, n: usize) -> ArrayRef {
+        self.input = None;
+        self.copied_views.clear();
+        if !self.in_progress.is_empty() {
+            self.flush_in_progress();
+        }
+        let nulls = self.nulls.take_n(n);
+        let views = self.views.drain(..n).collect::<Vec<_>>();
+        // Reused views may reference earlier blocks after later groups are emitted
+        let output =
+            GenericByteViewArray::<B>::new(views.into(), self.completed.clone(), nulls);
+        let remaining_nulls =
+            replace(&mut self.nulls, MaybeNullBufferBuilder::new()).build();
+        let remaining = GenericByteViewArray::<B>::new(
+            std::mem::take(&mut self.views).into(),
+            std::mem::take(&mut self.completed),
+            remaining_nulls,
+        )
+        .gc();
+        for row in 0..remaining.len() {
+            self.nulls.append(remaining.is_null(row));
+        }
+        self.views = remaining.views().to_vec();
+        self.completed = remaining.data_buffers().to_vec();
+        Arc::new(output)
     }
 
     fn take_buffers_with_whole_last(
@@ -567,6 +642,10 @@ impl<B: ByteViewType> GroupColumn for ByteViewGroupValueBuilder<B> {
             + self.views.capacity() * size_of::<u128>()
             + self.in_progress.capacity() * size_of::<u8>()
             + buffers_size
+            + self.copied_views.capacity() * (2 * size_of::<(u128, u128)>())
+            + self.input.as_ref().map_or(0, |_| {
+                size_of::<GenericByteViewArray<B>>() + 2 * size_of::<usize>()
+            })
             + size_of::<Self>()
     }
 
