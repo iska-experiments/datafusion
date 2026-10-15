@@ -80,13 +80,8 @@ hash_float!(f16, f32, f64);
 pub struct GroupValuesPrimitive<T: ArrowPrimitiveType> {
     /// The data type of the output array
     data_type: DataType,
-    /// Stores the `(group_index, hash)` based on the hash of its value
-    ///
-    /// We also store `hash` is for reducing cost of rehashing. Such cost
-    /// is obvious in high cardinality group by situation.
-    /// More details can see:
-    /// <https://github.com/apache/datafusion/issues/15961>
-    map: HashTable<(usize, u64)>,
+    /// Keep small keys in buckets, retain hashes for larger keys
+    map: KeyMap<T::Native>,
     /// The group index of the null value if any
     null_group: Option<usize>,
     /// The values for each group index
@@ -100,7 +95,11 @@ impl<T: ArrowPrimitiveType> GroupValuesPrimitive<T> {
         assert!(PrimitiveArray::<T>::is_compatible(&data_type));
         Self {
             data_type,
-            map: HashTable::with_capacity(128),
+            map: if size_of::<T::Native>() <= size_of::<u64>() {
+                KeyMap::Inline(HashTable::with_capacity(128))
+            } else {
+                KeyMap::Hashed(HashTable::with_capacity(128))
+            },
             values: Vec::with_capacity(128),
             null_group: None,
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
@@ -126,22 +125,35 @@ where
                 Some(key) => {
                     let state = &self.random_state;
                     let hash = key.hash(state);
-                    let insert = self.map.entry(
-                        hash,
-                        |&(g, h)| unsafe {
-                            hash == h && self.values.get_unchecked(g).is_eq(key)
+                    match &mut self.map {
+                        KeyMap::Inline(map) => match map.entry(
+                            hash,
+                            |&(_, stored)| stored.is_eq(key),
+                            |&(_, stored)| stored.hash(state),
+                        ) {
+                            hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
+                            hashbrown::hash_table::Entry::Vacant(v) => {
+                                let g = self.values.len();
+                                v.insert((g, key));
+                                self.values.push(key);
+                                g
+                            }
                         },
-                        |&(_, h)| h,
-                    );
-
-                    match insert {
-                        hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
-                        hashbrown::hash_table::Entry::Vacant(v) => {
-                            let g = self.values.len();
-                            v.insert((g, hash));
-                            self.values.push(key);
-                            g
-                        }
+                        KeyMap::Hashed(map) => match map.entry(
+                            hash,
+                            |&(g, h)| unsafe {
+                                hash == h && self.values.get_unchecked(g).is_eq(key)
+                            },
+                            |&(_, h)| h,
+                        ) {
+                            hashbrown::hash_table::Entry::Occupied(o) => o.get().0,
+                            hashbrown::hash_table::Entry::Vacant(v) => {
+                                let g = self.values.len();
+                                v.insert((g, hash));
+                                self.values.push(key);
+                                g
+                            }
+                        },
                     }
                 }
             };
@@ -151,7 +163,7 @@ where
     }
 
     fn size(&self) -> usize {
-        self.map.capacity() * size_of::<(usize, u64)>() + self.values.allocated_size()
+        self.map.bytes() + self.values.allocated_size()
     }
 
     fn is_empty(&self) -> bool {
@@ -184,19 +196,7 @@ where
                 build_primitive(std::mem::take(&mut self.values), self.null_group.take())
             }
             EmitTo::First(n) => {
-                self.map.retain(|entry| {
-                    // Decrement group index by n
-                    let group_idx = entry.0;
-                    match group_idx.checked_sub(n) {
-                        // Group index was >= n, shift value down
-                        Some(sub) => {
-                            entry.0 = sub;
-                            true
-                        }
-                        // Group index was < n, so remove from table
-                        None => false,
-                    }
-                });
+                self.map.shift(n);
                 let null_group = match &mut self.null_group {
                     Some(v) if *v >= n => {
                         *v -= n;
@@ -218,6 +218,54 @@ where
         self.values.clear();
         self.values.shrink_to(num_rows);
         self.map.clear();
-        self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
+        self.map.shrink_to(num_rows);
+    }
+}
+
+#[cfg(test)]
+#[path = "primitive_inline_test.rs"]
+mod inline_tests;
+
+enum KeyMap<K> {
+    Hashed(HashTable<(usize, u64)>),
+    Inline(HashTable<(usize, K)>),
+}
+
+impl<K> KeyMap<K> {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Hashed(map) => map.capacity() * size_of::<(usize, u64)>(),
+            Self::Inline(map) => map.capacity() * size_of::<(usize, K)>(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Hashed(map) => map.clear(),
+            Self::Inline(map) => map.clear(),
+        }
+    }
+
+    fn shift(&mut self, n: usize) {
+        fn shift<K>(map: &mut HashTable<(usize, K)>, n: usize) {
+            map.retain(|(index, _)| match index.checked_sub(n) {
+                Some(next) => {
+                    *index = next;
+                    true
+                }
+                None => false,
+            });
+        }
+        match self {
+            Self::Hashed(map) => shift(map, n),
+            Self::Inline(map) => shift(map, n),
+        }
+    }
+
+    fn shrink_to(&mut self, n: usize) {
+        match self {
+            Self::Hashed(map) => map.shrink_to(n, |_| 0),
+            Self::Inline(map) => map.shrink_to(n, |_| 0),
+        }
     }
 }
